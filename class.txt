@@ -1,0 +1,1 @@
+{'Charizard': 0, 'Omastar': 1, 'Onix': 2, 'Paras': 3, 'Parasect': 4, 'Persian': 5, 'Pidgeot': 6, 'Pidgeotto': 7, 'Pidgey': 8, 'Pikachu': 9, 'Pinsir': 10, 'Poliwag': 11, 'Poliwhirl': 12, 'Poliwrath': 13, 'Ponyta': 14, 'Porygon': 15, 'Primeape': 16, 'Psyduck': 17}
