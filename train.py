@@ -85,7 +85,12 @@ except ImportError:
 
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger("train")
-
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'
+os.environ["CUDA_LAUNCH_BLOCKING"] = '0'
+os.environ['NCCL_DEBUG'] = 'INFO'
+os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+os.environ["WORLD_SIZE"] = '4'
 # The first arg parser parses out only the --config argument, this argument is used to
 # load a yaml file containing key-values that override the defaults for the main parser below
 config_parser = parser = argparse.ArgumentParser(

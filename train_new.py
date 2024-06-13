@@ -7,17 +7,20 @@ import torch.nn.parallel
 import torch.optim as optim
 import torch.utils.data
 import torch.utils.data.distributed
+import torch.distributed as dist
 import torchvision.transforms as transforms
 from timm.utils import accuracy, AverageMeter, ModelEma
 from sklearn.metrics import classification_report
 from timm.data.mixup import Mixup
 from timm.loss import SoftTargetCrossEntropy
+from torch.utils.data import distributed
 from models.fastvit import fastvit_t8
 from torch.autograd import Variable
 from torchvision import datasets
 torch.backends.cudnn.benchmark = False
 import warnings
 warnings.filterwarnings("ignore")
+# os.environ["CUDA_VISIBLE_DEVICES"] = ["0", "1", "2", "3"]
 os.environ['CUDA_LAUNCH_BLOCKING']="1"
 
 # def seed_everything(seed=42):
@@ -54,42 +57,36 @@ def train(model, device, train_loader, optimizer, epoch,model_ema):
     acc5_meter = AverageMeter()
     total_num = len(train_loader.dataset)   #train_loader事包含训练数据的数据集加载器，在每个迭代中，从加载器中获取批量的数据和对应的目标标签
     print(total_num, len(train_loader))
-    count = 0
+
     for batch_idx, (data, target) in enumerate(train_loader):
         # 打印当前数据和模型所在设备信息
-        print(f"Batch {batch_idx + 1}/{len(train_loader)} - Data on {data.device}, Model on {next(model.parameters()).device}")
-        count += 1
+        print(f"pre-Batch {batch_idx + 1}/{len(train_loader)} - Data on {data.device}, Model on {next(model.parameters()).device}")
         data, target = data.to(device, non_blocking=True), target.to(device, non_blocking=True)
-        print(count)
-        print(f"Batch {batch_idx + 1}/{len(train_loader)} - Data on {data.device}, Model on {next(model.parameters()).device}")
+        print(f"doing-Batch {batch_idx + 1}/{len(train_loader)} - Data on {data.device}, Model on {next(model.parameters()).device}")
         samples, targets = mixup_fn(data, target)
-        print("misup_fn")
         output = model(samples)
         optimizer.zero_grad()
         print("zero_grad")
-        # 取消混合验证
-        loss = criterion_train(output, targets)
-        loss.backward()
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
-        optimizer.step()
-        # if use_amp:
-        #     with torch.cuda.amp.autocast():
-        #         loss = torch.nan_to_num(criterion_train(output, targets))
-        #     scaler.scale(loss).backward()
-        #     torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
-        #     # Unscales gradients and calls
-        #     # or skips optimizer.step()
-        #     scaler.step(optimizer)
-        #     # Updates the scale for next iteration
-        #     scaler.update()
-        # else:
-        #     loss = criterion_train(output, targets)
-        #     loss.backward()
-        #     # torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
-        #     optimizer.step()
+
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                loss = torch.nan_to_num(criterion_train(output, targets))
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
+            # Unscales gradients and calls
+            # or skips optimizer.step()
+            scaler.step(optimizer)
+            # Updates the scale for next iteration
+            scaler.update()
+        else:
+            loss = criterion_train(output, targets)
+            loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_GRAD)
+            optimizer.step()
 
         if model_ema is not None:
             model_ema.update(model)
+        print("synchronized here?")
         torch.cuda.synchronize()
         lr = optimizer.state_dict()['param_groups'][0]['lr']
         loss_meter.update(loss.item(), target.size(0))
@@ -175,8 +172,14 @@ if __name__ == '__main__':
     model_lr = 1e-4
     BATCH_SIZE = 8
     EPOCHS = 300
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(DEVICE)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    # print(DEVICE)
+    # torch.distributed.init_process_group(backend="nccl")
+    # torch.distributed.init_process_group(backend='nccl')
+    # local_rank = torch.distributed.get_rank()
+    # torch.cuda.set_device(local_rank)
+    # global device
+    # device = torch.device("cuda", local_rank)
     use_amp = True  # 是否使用混合精度
     use_dp = True #是否开启dp方式的多卡训练
     classes = 18
@@ -213,6 +216,9 @@ if __name__ == '__main__':
     dataset_train = datasets.ImageFolder('data/train', transform=transform)
     dataset_test = datasets.ImageFolder("data/val", transform=transform_test)
     print(dataset_train)
+
+    train_sampler = distributed.DistributedSampler(dataset_train)
+    val_sampler = distributed.DistributedSampler(dataset_test)
     # dataset_train = datasets.CIFAR10("./cifar10", download=True, train=True, transform=transform)
     # dataset_test = datasets.CIFAR10("./cifar10", download=True, train=False, transform=transform_test)
     with open('class.txt', 'w') as file:
@@ -220,9 +226,9 @@ if __name__ == '__main__':
     with open('class.json', 'w', encoding='utf-8') as file:
         file.write(json.dumps(dataset_train.class_to_idx))
     # 导入数据
-    train_loader = torch.utils.data.DataLoader(dataset_train, batch_size=BATCH_SIZE, pin_memory=True, shuffle=True,
-                                               drop_last=True, num_workers=2)
-    test_loader = torch.utils.data.DataLoader(dataset_test, batch_size=BATCH_SIZE, pin_memory=True, shuffle=False,num_workers=2)
+    train_loader = torch.utils.data.DataLoader(dataset_train, batch_size=BATCH_SIZE, sampler= train_sampler, pin_memory=True, shuffle=True,
+                                               drop_last=True, num_workers=4)
+    test_loader = torch.utils.data.DataLoader(dataset_test, batch_size=BATCH_SIZE, sampler=val_sampler, pin_memory=True, shuffle=False,num_workers=4)
 
     # 实例化模型并且移动到GPU
     criterion_train = nn.CrossEntropyLoss()
@@ -244,23 +250,27 @@ if __name__ == '__main__':
         model_ft.load_state_dict(model['state_dict'])
         Best_ACC = model['Best_ACC']
         start_epoch = model['epoch'] + 1
-    model_ft.to(DEVICE)
-    print(model_ft)
+    # model_ft.to(DEVICE)
+    # print(model_ft)
 
     # 选择简单暴力的Adam优化器，学习率调低
-    optimizer = optim.Adam(model_ft.parameters(), lr=model_lr)
+    optimizer = optim.AdamW(model_ft.parameters(), lr=model_lr)
     cosine_schedule = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=20, eta_min=1e-6)
 
+    device_ids = [0, 1, 2, 3]
     if use_amp:
         scaler = torch.cuda.amp.GradScaler()
-    if torch.cuda.device_count() > 1 and use_dp:
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
-        model_ft = torch.nn.DataParallel(model_ft)
+    # if torch.cuda.device_count() > 1 and use_dp:
+    #     print("Let's use", torch.cuda.device_count(), "GPUs!")
+    #     model_ft = torch.nn.DataParallel(model_ft, device_ids=device_ids)
+    # model_ft.to(DEVICE)
+    model_ft.to(device)
+    model_ft = torch.nn.DistributedDataParallel(model_ft, device_ids=device_ids, output_device=device, find_unused_parameters=True)
     if use_ema:
         model_ema = ModelEma(
             model_ft,
             decay=model_ema_decay,
-            device=DEVICE,
+            device=device,
             resume=resume)
     else:
         model_ema = None
@@ -280,15 +290,15 @@ if __name__ == '__main__':
     for epoch in range(start_epoch, EPOCHS + 1):
         epoch_list.append(epoch)
         log_dir['epoch_list'] = epoch_list
-        train_loss, train_acc = train(model_ft, DEVICE, train_loader, optimizer, epoch, model_ema)
+        train_loss, train_acc = train(model_ft, device, train_loader, optimizer, epoch, model_ema)
         train_loss_list.append(train_loss)
         train_acc_list.append(train_acc)
         log_dir['train_acc'] = train_acc_list
         log_dir['train_loss'] = train_loss_list
         if use_ema:
-            val_list, pred_list, val_loss, val_acc = val(model_ema.ema, DEVICE, test_loader)
+            val_list, pred_list, val_loss, val_acc = val(model_ema.ema, device, test_loader)
         else:
-            val_list, pred_list, val_loss, val_acc = val(model_ft, DEVICE, test_loader)
+            val_list, pred_list, val_loss, val_acc = val(model_ft, device, test_loader)
         val_loss_list.append(val_loss)
         val_acc_list.append(val_acc)
         log_dir['val_acc'] = val_acc_list
